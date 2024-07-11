@@ -6,7 +6,7 @@
     ],
     "config_flow": true,
     "dependencies": [],
-    "documentation": "https://github.com/grayyang/tuya-local",
+    "documentation": "https://github.com/make-all/tuya-local",
     "integration_type": "device",
     "iot_class": "local_push",
     "issue_tracker": "https://github.com/make-all/tuya-local/issues",
