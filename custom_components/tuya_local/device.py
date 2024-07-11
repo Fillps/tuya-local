@@ -21,6 +21,7 @@ from .const import (
     API_PROTOCOL_VERSIONS,
     CONF_DEVICE_CID,
     CONF_DEVICE_ID,
+    CONF_DEVICE_PARENT,
     CONF_LOCAL_KEY,
     CONF_POLL_ONLY,
     CONF_PROTOCOL_VERSION,
@@ -32,6 +33,16 @@ from .helpers.log import log_json
 
 _LOGGER = logging.getLogger(__name__)
 
+class TinyTuyaDeviceWrapper(tinytuya.Device):
+    def __init__(self, local_device, dev_id, address=None, local_key="", dev_type="default", connection_timeout=5, version=3.1, persist=False, cid=None, node_id=None, parent=None, connection_retry_limit=5, connection_retry_delay=5):
+        super().__init__(dev_id, address, local_key, dev_type, connection_timeout, version, persist, cid, node_id, parent, connection_retry_limit, connection_retry_delay)
+        self._local_device = local_device
+
+    def _process_response(self, response):
+        if self._local_device._gateway_device:
+            self._local_device._gateway_device.trigger_subdevice_update(self.cid)
+        return super()._process_response(response)
+
 
 class TuyaLocalDevice(object):
     def __init__(
@@ -42,6 +53,7 @@ class TuyaLocalDevice(object):
         local_key,
         protocol_version,
         dev_cid,
+        parent_dev_id,
         hass: HomeAssistant,
         poll_only=False,
     ):
@@ -59,24 +71,33 @@ class TuyaLocalDevice(object):
             poll_only (bool): True if the device should be polled only
         """
         self._name = name
+        self._dev_id = dev_id
+        self._dev_cid = dev_cid
+        self._parent_dev_id = parent_dev_id
+        self._address = address
+        self._local_key = local_key
         self._children = []
         self._force_dps = []
         self._running = False
         self._shutdown_listener = None
         self._startup_listener = None
+        self._gateway_device = None
+        self._hass = hass
+
         self._api_protocol_version_index = None
         self._api_protocol_working = False
         self._api_working_protocol_failures = 0
         try:
             if dev_cid:
-                self._api = tinytuya.Device(
+                self._gateway_device = TuyaLocalGatewayDeviceRegistry.get_gateway_device(self)
+                self._api = TinyTuyaDeviceWrapper(
+                    self,
                     dev_id,
                     cid=dev_cid,
-                    parent=tinytuya.Device(dev_id, address, local_key),
+                    parent=self._gateway_device.api,
                 )
             else:
                 self._api = tinytuya.Device(dev_id, address, local_key)
-            self.dev_cid = dev_cid
         except Exception as e:
             _LOGGER.error(
                 "%s: %s while initialising device %s",
@@ -88,16 +109,12 @@ class TuyaLocalDevice(object):
 
         # we handle retries at a higher level so we can rotate protocol version
         self._api.set_socketRetryLimit(1)
-        if self._api.parent:
-            self._api.parent.set_socketRetryLimit(1)
 
         self._refresh_task = None
-        self._protocol_configured = protocol_version
+        self._protocol_configured = self._gateway_device.api_protocol_version if self._gateway_device.api_protocol_version else protocol_version
         self._poll_only = poll_only
         self._temporary_poll = False
         self._reset_cached_state()
-
-        self._hass = hass
 
         # API calls to update Tuya devices are asynchronous and non-blocking.
         # This means you can send a change and immediately request an updated
@@ -121,9 +138,29 @@ class TuyaLocalDevice(object):
         return self._name
 
     @property
+    def address(self):
+        return self._address
+
+    @property
+    def local_key(self):
+        return self._local_key
+
+    @property
+    def dev_id(self):
+        return self._dev_id
+
+    @property
+    def dev_cid(self):
+        return self._dev_cid
+
+    @property
+    def parent_dev_id(self):
+        return self._parent_dev_id
+
+    @property
     def unique_id(self):
         """Return the unique id for this device (the dev_id or dev_cid)."""
-        return self.dev_cid or self._api.id
+        return self._dev_cid or self._dev_id
 
     @property
     def device_info(self):
@@ -244,106 +281,126 @@ class TuyaLocalDevice(object):
     def resume(self):
         self._temporary_poll = False
 
+    def enable_connection_test_mode(self):
+        if self._gateway_device:
+            self._gateway_device.enable_connection_test_mode()
+
+    def disable_connection_test_mode(self):
+        if self._gateway_device:
+            self._gateway_device.disable_connection_test_mode()
+
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
-        # If we didn't yet get any state from the device, we may need to
-        # negotiate the protocol before making the connection persistent
-        persist = not self.should_poll
-        # flag to alternate updatedps and status calls to ensure we get
-        # all dps updated
-        dps_updated = False
+        if self._gateway_device:
+            result_queue = self._gateway_device.start_monitoring_subdevice(self)
 
-        self._api.set_socketPersistent(persist)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(persist)
-
-        while self._running:
-            try:
-                last_cache = self._cached_state.get("updated_at", 0)
-                now = time()
-                full_poll = False
-                if persist == self.should_poll:
-                    # use persistent connections after initial communication
-                    # has been established.  Until then, we need to rotate
-                    # the protocol version, which seems to require a fresh
-                    # connection.
-                    persist = not self.should_poll
-                    _LOGGER.debug(
-                        "%s persistant connection set to %s", self.name, persist
-                    )
-                    self._api.set_socketPersistent(persist)
-                    if self._api.parent:
-                        self._api.parent.set_socketPersistent(persist)
-
-                if now - last_cache > self._CACHE_TIMEOUT:
-                    if (
-                        self._force_dps
-                        and not dps_updated
-                        and self._api_protocol_working
-                    ):
-                        poll = await self._retry_on_failed_connection(
-                            lambda: self._api.updatedps(self._force_dps),
-                            f"Failed to update device dps for {self.name}",
-                        )
-                        dps_updated = True
+            while self._running:
+                try:
+                    result = await result_queue.get()
+                    if not result:
+                        _LOGGER.debug("%s exit monitoring loop since gateway stopped", self.name)
+                        self._running = False
                     else:
-                        poll = await self._retry_on_failed_connection(
-                            lambda: self._api.status(),
-                            f"Failed to fetch device status for {self.name}",
-                        )
-                        dps_updated = False
-                        full_poll = True
-                elif persist:
-                    await self._hass.async_add_executor_job(
-                        self._api.heartbeat,
-                        True,
-                    )
-                    poll = await self._hass.async_add_executor_job(
-                        self._api.receive,
-                    )
-                else:
-                    await asyncio.sleep(5)
-                    poll = None
+                        yield result
+                except asyncio.CancelledError:
+                    self._running = False
+                    await self._gateway_device.async_stop_monitoring_subdevice(self)
+                    raise
 
-                if poll:
-                    if "Error" in poll:
-                        _LOGGER.warning(
-                            "%s error reading: %s", self.name, poll["Error"]
+            await self._gateway_device.async_stop_monitoring_subdevice(self)
+        else:
+            # If we didn't yet get any state from the device, we may need to
+            # negotiate the protocol before making the connection persistent
+            persist = not self.should_poll
+            # flag to alternate updatedps and status calls to ensure we get
+            # all dps updated
+            dps_updated = False
+            self._api.set_socketPersistent(persist)
+
+            while self._running:
+                try:
+                    last_cache = self._cached_state.get("updated_at", 0)
+                    now = time()
+                    full_poll = False
+                    if persist == self.should_poll:
+                        # use persistent connections after initial communication
+                        # has been established.  Until then, we need to rotate
+                        # the protocol version, which seems to require a fresh
+                        # connection.
+                        persist = not self.should_poll
+                        _LOGGER.debug(
+                            "%s persistant connection set to %s", self.name, persist
                         )
-                        if "Payload" in poll and poll["Payload"]:
-                            _LOGGER.info(
-                                "%s err payload: %s",
-                                self.name,
-                                poll["Payload"],
+                        self._api.set_socketPersistent(persist)
+
+                    if now - last_cache > self._CACHE_TIMEOUT:
+                        if (
+                            self._force_dps
+                            and not dps_updated
+                            and self._api_protocol_working
+                        ):
+                            poll = await self._retry_on_failed_connection(
+                                lambda: self._api.updatedps(self._force_dps),
+                                f"Failed to update device dps for {self.name}",
                             )
+                            dps_updated = True
+                        else:
+                            poll = await self._retry_on_failed_connection(
+                                lambda: self._api.status(),
+                                f"Failed to fetch device status for {self.name}",
+                            )
+                            dps_updated = False
+                            full_poll = True
+                    elif persist:
+                        await self._hass.async_add_executor_job(
+                            self._api.heartbeat,
+                            True,
+                        )
+                        poll = await self._hass.async_add_executor_job(
+                            self._api.receive,
+                        )
                     else:
-                        if "dps" in poll:
-                            poll = poll["dps"]
-                        poll["full_poll"] = full_poll
-                        yield poll
+                        await asyncio.sleep(5)
+                        poll = None
 
-                await asyncio.sleep(0.1 if self.has_returned_state else 5)
+                    if poll:
+                        if "Error" in poll:
+                            _LOGGER.warning(
+                                "%s error reading: %s", self.name, poll["Error"]
+                            )
+                            if "Payload" in poll and poll["Payload"]:
+                                _LOGGER.info(
+                                    "%s err payload: %s",
+                                    self.name,
+                                    poll["Payload"],
+                                )
+                        else:
+                            if "dps" in poll:
+                                poll = poll["dps"]
+                            poll["full_poll"] = full_poll
+                            yield poll
 
-            except CancelledError:
-                self._running = False
-                # Close the persistent connection when exiting the loop
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
-                raise
-            except Exception as t:
-                _LOGGER.exception(
-                    "%s receive loop error %s:%s",
-                    self.name,
-                    type(t),
-                    t,
-                )
-                await asyncio.sleep(5)
+                    await asyncio.sleep(0.1 if self.has_returned_state else 5)
 
-        # Close the persistent connection when exiting the loop
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+                except CancelledError:
+                    self._running = False
+                    # Close the persistent connection when exiting the loop
+                    self._api.set_socketPersistent(False)
+                    if self._api.parent:
+                        self._api.parent.set_socketPersistent(False)
+                    raise
+                except Exception as t:
+                    _LOGGER.exception(
+                        "%s receive loop error %s:%s",
+                        self.name,
+                        type(t),
+                        t,
+                    )
+                    await asyncio.sleep(5)
+
+            # Close the persistent connection when exiting the loop
+            self._api.set_socketPersistent(False)
+
 
     async def async_possible_types(self):
         cached_state = self._get_cached_state()
@@ -514,6 +571,8 @@ class TuyaLocalDevice(object):
             for key in properties.keys():
                 pending_updates[key]["updated_at"] = now
                 pending_updates[key]["sent"] = True
+            if self._gateway_device:
+                self._gateway_device.trigger_subdevice_update(self.dev_cid)
         finally:
             self._lock.release()
 
@@ -536,6 +595,8 @@ class TuyaLocalDevice(object):
                     if isinstance(retval, dict) and "Error" in retval:
                         raise AttributeError(retval["Error"])
                     self._api_protocol_working = True
+                    if self._gateway_device:
+                        self._gateway_device.confirm_protocol_version()
                     self._api_working_protocol_failures = 0
                     return retval
             except Exception as e:
@@ -619,17 +680,276 @@ class TuyaLocalDevice(object):
             self._api.set_version,
             new_version,
         )
-        if self._api.parent:
-            await self._hass.async_add_executor_job(
-                self._api.parent.set_version,
-                new_version,
-            )
+        if self._gateway_device:
+            await self._gateway_device.set_api_protocol_version(new_version)
 
     @staticmethod
     def get_key_for_value(obj, value, fallback=None):
         keys = list(obj.keys())
         values = list(obj.values())
         return keys[values.index(value)] if value in values else fallback
+
+
+class TuyaLocalGatewayDevice(object):
+    def __init__(
+        self,
+        dev_id,
+        address,
+        local_key,
+        hass: HomeAssistant
+    ):
+        self._dev_id = dev_id
+        self._hass = hass
+        self._subdevices = {}
+        self._api = tinytuya.Device(dev_id, address, local_key)
+        self._api.set_socketRetryLimit(1)
+        # self._api.set_socketTimeout(10)
+        self._api_protocol_version_index = None
+        self._api_protocol_working = False
+        self._api_socket_persistent = False
+        self._monitoring_task = None
+        self._running = False
+        self._subdevice_update_required = asyncio.Event()
+
+
+    async def subdevices_receive_loop(self):
+        _LOGGER.info("Gateway %s started subdevices monitoring", self._dev_id)
+
+        while self._running:
+            try:
+                self._subdevice_update_required.clear()
+
+                target = max(self._subdevices.values(), key=lambda d: d["pending_update_count"], default=None)
+                if (not target) or (target["pending_update_count"] <= 0):
+                    target = min(self._subdevices.values(), key=lambda d: d["next_check"], default=None)
+                _LOGGER.debug("Gateway %s begin new poll iteration: %s(next_check=%s, pending_update_count=%s)", self._dev_id,
+                              target["subdevice"].name if target else None,
+                              target["next_check"] if target else None,
+                              target["pending_update_count"] if target else None
+                )
+                if not target:
+                    # No subdevice under monitoring, yield control back to event loop to wait stopping of the loop
+                    await asyncio.sleep(0)
+                elif not target["pending_update_count"] > 0 and time() < target["next_check"]:
+                    # Wait to poll the subdevice which is earlist for status polling
+                    timediff = target["next_check"] - time()
+                    _LOGGER.debug("Gateway %s wait %s before poll next subdevice %s", self._dev_id, timediff, target["subdevice"].name)
+                    done, _ = await asyncio.wait([asyncio.create_task(self._subdevice_update_required.wait())], timeout=timediff)
+                    if done:
+                        _LOGGER.debug("Gateway %s woke up earlier since update required", self._dev_id)
+                else:
+                    try:
+                        subdevice = target["subdevice"]
+                        _LOGGER.debug("Gateway %s poll status for subdevice: %s",self._dev_id, subdevice.name)
+
+                        receive_required = target["pending_update_count"] > 0
+                        should_poll = subdevice.should_poll
+                        full_poll = False
+
+                        persist = not all([ value["subdevice"].should_poll for value in self._subdevices.values() ])
+                        if persist != self._api_socket_persistent:
+                            self._api_socket_persistent = persist
+                            self._api.set_socketPersistent(persist)
+                            _LOGGER.debug(
+                                "Gateway %s persistant connection set to %s", self._dev_id, persist
+                            )
+
+                        now = time()
+                        last_cache = subdevice._cached_state.get("updated_at", 0)
+                        if (not receive_required) and (now - last_cache > subdevice._CACHE_TIMEOUT):
+                            if (
+                                subdevice._force_dps
+                                and not target["dps_updated"]
+                                and self._api_protocol_working
+                            ):
+                                poll = await subdevice._retry_on_failed_connection(
+                                    lambda: subdevice._api.updatedps(subdevice._force_dps),
+                                    f"Failed to update device dps for {subdevice.name}",
+                                )
+                                target["dps_updated"] = True
+                            else:
+                                poll = await subdevice._retry_on_failed_connection(
+                                    lambda: subdevice._api.status(),
+                                    f"Failed to fetch device status for {subdevice.name}",
+                                )
+                                target["dps_updated"] = False
+                                full_poll = True
+                        elif (not should_poll) or receive_required:
+                            await subdevice._hass.async_add_executor_job(
+                                subdevice._api.heartbeat,
+                                True,
+                            )
+                            poll = await subdevice._hass.async_add_executor_job(
+                                self.receive_subdevice_update,
+                                subdevice.dev_cid
+                            )
+                        else:
+                            poll = None
+
+                        if poll:
+                            if "Error" in poll:
+                                _LOGGER.warning(
+                                    "%s error reading: %s", subdevice.name, poll["Error"]
+                                )
+                                if "Payload" in poll and poll["Payload"]:
+                                    _LOGGER.info(
+                                        "%s err payload: %s",
+                                        subdevice.name,
+                                        poll["Payload"],
+                                    )
+                            else:
+                                if "dps" in poll:
+                                    poll = poll["dps"]
+                                poll["full_poll"] = full_poll
+                                target["queue"].put_nowait(poll)
+
+                        pending_updates = [ value for
+                                           key, value in subdevice._get_pending_updates()
+                                           if key not in poll or not value["sent"] or poll[key] != value["value"]]
+                        target["next_check"] = time() + (0.1 if pending_updates or target["pending_update_count"] > 0 else 5)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as t:
+                        _LOGGER.exception(
+                            "%s receive loop error %s:%s",
+                            target["subdevice"].name,
+                            type(t),
+                            t,
+                        )
+                        target["next_check"] = time() + 5
+            except asyncio.CancelledError:
+                self._running = False
+                self._api_socket_persistent = False
+                self._api.set_socketPersistent(False)
+                for subdevice in self._subdevices.items():
+                    subdevice["queue"].put_nowait(None)
+                _LOGGER.info("Gateway %s stopped subdevices monitoring", self._dev_id)
+                raise
+
+        self._api_socket_persistent = False
+        self._api.set_socketPersistent(False)
+        for subdevice in self._subdevices.items():
+            subdevice["queue"].put_nowait(None)
+        _LOGGER.info("Gateway %s stopped subdevices monitoring", self._dev_id)
+
+
+    async def set_api_protocol_version(self, protocol_version):
+        if not self._api_protocol_working:
+            await self._hass.async_add_executor_job(
+                self._api.set_version,
+                protocol_version,
+            )
+            self._api_protocol_version_index = API_PROTOCOL_VERSIONS.index(protocol_version)
+            _LOGGER.debug("Gateway %s has swithed protocol version: %s", self._dev_id, protocol_version)
+
+    def confirm_protocol_version(self):
+        self._api_protocol_working = True
+        _LOGGER.info("Gateway %s protocol version negociation completed: %s", self._dev_id, self.api_protocol_version)
+
+    @property
+    def api_protocol_version(self):
+        return API_PROTOCOL_VERSIONS[self._api_protocol_version_index] if self._api_protocol_working else None
+
+
+    @property
+    def api_socket_persistent(self):
+        return self._api_socket_persistent
+
+
+    def start_monitoring_subdevice(self, subdevice: TuyaLocalDevice):
+        if not subdevice.dev_cid in self._subdevices:
+            data = {
+                "subdevice": subdevice,
+                "queue": asyncio.Queue(),
+                "dps_updated": False,
+                "next_check": 0,
+                "pending_update_count": 0,
+                "pending_update_lock": Lock()
+            }
+            self._subdevices.setdefault(subdevice.dev_cid, data)
+
+        if not self._running:
+            _LOGGER.debug("Gateway %s starting subdevices monitoring", self._dev_id)
+            self._running = True
+            self._monitoring_task = self._hass.async_create_task(self.subdevices_receive_loop())
+
+        return self._subdevices[subdevice.dev_cid]["queue"]
+
+
+    async def async_stop_monitoring_subdevice(self, subdevice: TuyaLocalDevice):
+        del self._subdevices[subdevice.dev_cid]
+
+        if not self._subdevices:
+            _LOGGER.debug("Gateway %s closing subdevices monitoring", self._dev_id)
+            self._running = False
+
+            if self._monitoring_task:
+                self._subdevice_update_required.set()
+                await self._monitoring_task
+                self._monitoring_task = None
+
+
+    def trigger_subdevice_update(self, dev_cid):
+        # blocking code shoule be executed only inside one executor
+        data = self._subdevices.get(dev_cid, None)
+        if data:
+            _LOGGER.debug("Trigger gateway %s quick update on subdevice: %s", self._dev_id, data["subdevice"].name)
+            try:
+                data["pending_update_lock"].acquire()
+                data["pending_update_count"] = data["pending_update_count"] + 1
+            finally:
+                data["pending_update_lock"].release()
+            self._subdevice_update_required.set()
+
+    def receive_subdevice_update(self, dev_cid):
+        data = self._subdevices.get(dev_cid, None)
+        if data:
+            try:
+                data["pending_update_lock"].acquire()
+                data["pending_update_count"] = data["pending_update_count"] - 1 if data["pending_update_count"] > 0 else 0
+            finally:
+                data["pending_update_lock"].release()
+            return data["subdevice"]._api.receive()
+        return None
+
+
+    def enable_connection_test_mode(self):
+        """
+        Increase socket retry limit according to number of subdevices behind the gateway.
+        The tuya device may return null response acting as ack of the request. The default retry limit = 1 handle
+        such ack response to get the real response by retry once.
+        However, in the case of one gateway service, it is observed that it may emit multiple null response which seems
+        as the ack for multiple subdevices. Thus, we increase the retry time here to move multiple null response and get
+        the actual response.
+        """
+        self._api.set_socketRetryLimit(len(self._subdevices) * 2 + 1)
+
+    def disable_connection_test_mode(self):
+        self._api.set_socketRetryLimit(1)
+
+    @property
+    def api(self):
+        return self._api
+
+
+class TuyaLocalGatewayDeviceRegistry(object):
+    _gateway_devices = {}
+
+    @staticmethod
+    def get_gateway_device(device: TuyaLocalDevice) -> TuyaLocalGatewayDevice:
+        key = TuyaLocalGatewayDeviceRegistry._get_key(device.parent_dev_id, device.local_key)
+        gateway_device = TuyaLocalGatewayDeviceRegistry._gateway_devices.get(key, None)
+        if not gateway_device:
+            _LOGGER.debug("Creating gateway device: %s", device.parent_dev_id)
+            gateway_device = TuyaLocalGatewayDevice(device.parent_dev_id, device.address, device.local_key, device._hass)
+            TuyaLocalGatewayDeviceRegistry._gateway_devices[key] = gateway_device
+
+        _LOGGER.info("Subdevice %s(id=%s,cid=%s) uses gateway device: %s", device.name, device.dev_id, device.dev_cid, device.parent_dev_id)
+        return gateway_device
+
+    @staticmethod
+    def _get_key(dev_id, local_key):
+        "#dev_id:{}|local_key:{}".format(dev_id, local_key)
 
 
 def setup_device(hass: HomeAssistant, config: dict):
@@ -644,6 +964,7 @@ def setup_device(hass: HomeAssistant, config: dict):
         config[CONF_LOCAL_KEY],
         config[CONF_PROTOCOL_VERSION],
         config.get(CONF_DEVICE_CID),
+        config.get(CONF_DEVICE_PARENT),
         hass,
         config[CONF_POLL_ONLY],
     )
